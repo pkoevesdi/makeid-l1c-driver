@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Print a label on the MakeID L1-C directly, without CUPS: SVG, PNG or text."""
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import l1c  # noqa: E402
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+
+
+def inkscape_cmd():
+    if shutil.which("inkscape"):
+        return ["inkscape"]
+    return ["flatpak", "run", "--command=inkscape", "org.inkscape.Inkscape"]
+
+
+def load_svg(svg):
+    cache = Path.home() / ".cache"
+    cache.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=cache) as d:        # Flatpak Inkscape cannot see /tmp
+        png = Path(d) / "l1c.png"
+        subprocess.run(inkscape_cmd() + [
+            "--export-type=png", "--export-area-page", f"--export-height={l1c.TAPE}",
+            "--export-background=white", "--export-background-opacity=1",
+            f"--export-filename={png}", str(Path(svg).resolve())], check=True, capture_output=True)
+        return Image.open(png).copy()
+
+
+def render_text(text, font="DejaVuSans-Bold.ttf", size=64):
+    f = ImageFont.truetype(font, size)
+    x0, y0, x1, y1 = f.getbbox(text)
+    img = Image.new("L", (x1 - x0 + 2 * l1c.FEED, l1c.HEAD), 255)
+    ImageDraw.Draw(img).text((l1c.FEED - x0, (l1c.HEAD - (y1 - y0)) // 2 - y0), text, font=f, fill=0)
+    return img
+
+
+def to_bitmap(img, threshold=128):
+    """Whole label (height 128 = 16 mm or 96 = 12 mm) → 1-bit image of what the head prints."""
+    if img.mode in ("RGBA", "LA", "P"):
+        img = Image.alpha_composite(Image.new("RGBA", img.size, "white"), img.convert("RGBA"))
+    g = img.convert("L")
+    if g.height == l1c.TAPE:
+        g = g.crop((0, l1c.MARGIN, g.width, l1c.MARGIN + l1c.HEAD))
+    elif g.height != l1c.HEAD:
+        raise l1c.PrinterError(f"image is {g.height} px high, expected {l1c.TAPE} (16 mm) or {l1c.HEAD} (12 mm)")
+    if g.width <= 2 * l1c.FEED:
+        raise l1c.PrinterError("label shorter than the 8 mm the printer feeds anyway")
+    g = g.crop((l1c.FEED, 0, g.width - l1c.FEED, g.height))    # the printer adds these 4 mm itself
+    return g.point(lambda v: 255 if v >= threshold else 0, "1")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("file", nargs="?", help="SVG (16 mm high) or PNG (128 or 96 px high)")
+    ap.add_argument("-t", "--text", help="print this text instead of a file")
+    ap.add_argument("-d", "--darkness", type=int, choices=(10, 15, 20), default=15)
+    ap.add_argument("-p", "--preview", metavar="PNG", help="write what would be printed, do not print")
+    ap.add_argument("-a", "--addr", help="printer address (default: $L1C_ADDR or search)")
+    ap.add_argument("--status", action="store_true", help="show printer status")
+    a = ap.parse_args()
+
+    try:
+        if a.status:
+            with l1c.L1C(a.addr) as p:
+                print(f"{p.addr}: {l1c.parse_status(p.status())}, firmware {p.firmware()}")
+            return
+        if a.text:
+            img = render_text(a.text)
+        elif a.file:
+            img = load_svg(a.file) if a.file.lower().endswith(".svg") else Image.open(a.file)
+        else:
+            ap.error("give a file or --text")
+        bm = to_bitmap(img)
+        mm = bm.width * 0.125 + 8
+        if a.preview:
+            bm.save(a.preview)
+            print(f"{a.preview}: label {mm:.1f} mm")
+            return
+        px = bm.load()
+        rows = l1c.head_rows(bm.width, lambda x, y: px[x, y] == 0)
+        with l1c.L1C(a.addr) as p:
+            p.check_ready()
+            st = p.print_rows(rows, darkness=a.darkness)
+        print(f"printed {mm:.1f} mm" + (f", battery {st['battery']} %, tape {st['label']}" if st else ""))
+    except (l1c.PrinterError, subprocess.CalledProcessError, OSError) as e:
+        sys.exit(f"l1c-print: {e}")
+
+
+if __name__ == "__main__":
+    main()

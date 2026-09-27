@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""IPP Everywhere printer for the MakeID L1-C.
+
+Serves ipp://<host>:8631/ipp/print. Clients (CUPS, Windows, macOS) send PWG raster; the
+page is the whole label, 16 mm high and as long as the label. Print quality draft /
+normal / high maps to the printer's darkness light / normal / dark.
+"""
+import argparse
+import io
+import queue
+import struct
+import sys
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import l1c  # noqa: E402
+
+# --- IPP encoding ------------------------------------------------------------
+
+T_OP, T_JOB, T_END, T_PRINTER, T_UNSUPPORTED_GROUP = 0x01, 0x02, 0x03, 0x04, 0x05
+INTEGER, BOOLEAN, ENUM = 0x21, 0x22, 0x23
+DATETIME, RESOLUTION, RANGE, BEGCOL, ENDCOL = 0x31, 0x32, 0x33, 0x34, 0x37
+TEXT, NAME, KEYWORD, URI, URISCHEME, CHARSET, LANG, MIME, MEMBER = 0x41, 0x42, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A
+NOVALUE = 0x13
+
+OK, OK_IGNORED = 0x0000, 0x0001
+BAD_REQUEST, NOT_FOUND, NOT_POSSIBLE, FORMAT_UNSUPPORTED = 0x0400, 0x0406, 0x0404, 0x040A
+OP_UNSUPPORTED, INTERNAL_ERROR = 0x0501, 0x0500
+
+PRINT_JOB, VALIDATE_JOB, CREATE_JOB, SEND_DOCUMENT = 0x02, 0x04, 0x05, 0x06
+CANCEL_JOB, GET_JOB_ATTRIBUTES, GET_JOBS, GET_PRINTER_ATTRIBUTES = 0x08, 0x09, 0x0A, 0x0B
+CLOSE_JOB, IDENTIFY_PRINTER = 0x3B, 0x3C
+OPERATIONS = [PRINT_JOB, VALIDATE_JOB, CREATE_JOB, SEND_DOCUMENT, CANCEL_JOB, GET_JOB_ATTRIBUTES,
+              GET_JOBS, GET_PRINTER_ATTRIBUTES, CLOSE_JOB, IDENTIFY_PRINTER]
+
+PENDING, PROCESSING, CANCELED, ABORTED, COMPLETED = 3, 5, 7, 8, 9
+IDLE, BUSY, STOPPED = 3, 4, 5
+
+
+def _decode(tag, v):
+    if tag in (INTEGER, ENUM):
+        return struct.unpack(">i", v)[0]
+    if tag == BOOLEAN:
+        return v != b"\0"
+    if tag == RANGE:
+        return struct.unpack(">ii", v)
+    if tag == RESOLUTION:
+        return struct.unpack(">iib", v)
+    if 0x40 <= tag <= 0x4A:
+        return v.decode("utf-8", "replace")
+    return v
+
+
+def parse_request(data):
+    """→ (version, operation, request id, {group tag: {name: [values]}}, document bytes)."""
+    ver, op, rid = struct.unpack(">HHI", data[:8])
+    pos = 8
+    groups = {}
+
+    def read():
+        nonlocal pos
+        tag = data[pos]
+        nlen = struct.unpack(">H", data[pos + 1:pos + 3])[0]
+        name = data[pos + 3:pos + 3 + nlen].decode()
+        pos += 3 + nlen
+        vlen = struct.unpack(">H", data[pos:pos + 2])[0]
+        val = data[pos + 2:pos + 2 + vlen]
+        pos += 2 + vlen
+        return tag, name, val
+
+    def collection():
+        col, member = {}, None
+        while True:
+            tag, _, val = read()
+            if tag == ENDCOL:
+                return col
+            if tag == MEMBER:
+                member = val.decode()
+                col[member] = []
+            elif tag == BEGCOL:
+                col[member].append(collection())
+            else:
+                col[member].append(_decode(tag, val))
+
+    cur, last = None, None
+    while pos < len(data):
+        tag = data[pos]
+        if tag == T_END:
+            pos += 1
+            break
+        if tag < 0x10:
+            pos += 1
+            cur = groups.setdefault(tag, {})
+            continue
+        tag, name, val = read()
+        value = collection() if tag == BEGCOL else _decode(tag, val)
+        if name:
+            last = name
+            cur[name] = [value]
+        elif last:
+            cur[last].append(value)
+    return ver, op, rid, groups, data[pos:]
+
+
+def _encode_value(tag, v):
+    if tag in (INTEGER, ENUM):
+        return struct.pack(">i", v)
+    if tag == BOOLEAN:
+        return b"\1" if v else b"\0"
+    if tag == RANGE:
+        return struct.pack(">ii", *v)
+    if tag == RESOLUTION:
+        return struct.pack(">iib", *v)
+    if tag == DATETIME:
+        t = time.gmtime(v)
+        return struct.pack(">HBBBBBBcBB", t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, 0, b"+", 0, 0)
+    if tag == NOVALUE:
+        return b""
+    return v.encode()
+
+
+def encode_attr(tag, name, values):
+    out = bytearray()
+    for i, v in enumerate(values):
+        n = name.encode() if i == 0 else b""
+        if tag == BEGCOL:
+            out += bytes([BEGCOL]) + struct.pack(">H", len(n)) + n + b"\0\0"
+            for mtag, mname, mvals in v:
+                out += bytes([MEMBER]) + b"\0\0" + struct.pack(">H", len(mname)) + mname.encode()
+                out += encode_attr(mtag, "", mvals)
+            out += bytes([ENDCOL]) + b"\0\0\0\0"
+        else:
+            b = _encode_value(tag, v)
+            out += bytes([tag]) + struct.pack(">H", len(n)) + n + struct.pack(">H", len(b)) + b
+    return bytes(out)
+
+
+def response(status, rid, groups):
+    out = bytearray(struct.pack(">HHI", 0x0200, status, rid))
+    for gtag, attrs in groups:
+        out.append(gtag)
+        for a in attrs:
+            out += encode_attr(*a)
+    out.append(T_END)
+    return bytes(out)
+
+
+# --- Printer model -----------------------------------------------------------
+
+LENGTHS = [20, 25, 30, 40, 50, 60, 80, 100, 150, 200]      # mm
+MIN_LEN, MAX_LEN = 10, 1000
+
+
+def media_name(mm):
+    return f"oe_l1c-{mm}mm_{mm}x16mm"
+
+
+def media_col(x, y=1600):
+    """x = label length, y = tape width, both in 1/100 mm (x may be a range)."""
+    size = [(RANGE if isinstance(x, tuple) else INTEGER, "x-dimension", [x]), (INTEGER, "y-dimension", [y])]
+    col = [(BEGCOL, "media-size", [size])]
+    col += [(INTEGER, f"media-{s}-margin", [0]) for s in ("bottom", "left", "right", "top")]
+    col += [(KEYWORD, "media-source", ["main"]), (KEYWORD, "media-type", ["labels-continuous"])]
+    return col
+
+
+class Job:
+    def __init__(self, jid, name, user, attrs):
+        self.id, self.name, self.user, self.attrs = jid, name, user, attrs
+        self.state, self.reasons, self.message = PENDING, "none", ""
+        self.created, self.processing, self.completed = int(time.time()), 0, 0
+        self.document = None
+        self.done = threading.Event()
+
+
+class Printer:
+    def __init__(self, addr):
+        self.addr = addr
+        self.started = time.time()
+        self.uuid = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_OID, "l1c-" + (addr or "any")))
+        self.jobs = {}
+        self.next_id = 1
+        self.lock = threading.Lock()
+        self.queue = queue.Queue()
+        self.state, self.reasons, self.message = IDLE, "none", ""
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    def uptime(self):
+        return int(time.time() - self.started) + 1
+
+    def new_job(self, name, user, attrs):
+        with self.lock:
+            job = Job(self.next_id, name, user, attrs)
+            self.next_id += 1
+            self.jobs[job.id] = job
+            for old in sorted(self.jobs)[:-50]:
+                if self.jobs[old].state >= CANCELED:
+                    del self.jobs[old]
+        return job
+
+    def worker(self):
+        while True:
+            job = self.queue.get()
+            if job.state != PENDING:
+                continue
+            job.state, job.processing = PROCESSING, int(time.time())
+            self.state = BUSY
+            try:
+                self.print_job(job)
+                job.state, job.reasons = COMPLETED, "job-completed-successfully"
+                self.reasons, self.message = "none", ""
+            except l1c.PrinterError as e:
+                job.state, job.reasons, job.message = ABORTED, "aborted-by-system", str(e)
+                self.reasons = "offline-report" if "not reachable" in str(e) or "no L1" in str(e) else "other-warning"
+                self.message = str(e)
+                log(f"job {job.id}: {e}")
+            except Exception as e:  # noqa: BLE001
+                job.state, job.reasons, job.message = ABORTED, "aborted-by-system", f"internal error: {e}"
+                log(f"job {job.id}: internal error: {e!r}")
+            job.completed = int(time.time())
+            job.document = None
+            self.state = IDLE
+            job.done.set()
+
+    def print_job(self, job):
+        labels = [l1c.raster_label(*page) for page in l1c.read_raster(io.BytesIO(job.document))]
+        if not labels:
+            raise l1c.PrinterError("document has no pages")
+        copies = job.attrs.get("copies", [1])[0]
+        quality = job.attrs.get("print-quality", [4])[0]
+        darkness = {3: 10, 4: 15, 5: 20}.get(quality, 15)
+        with l1c.L1C(self.addr) as p:
+            p.check_ready()
+            n = 0
+            for _ in range(max(1, copies)):
+                for rows in labels:
+                    if job.state != PROCESSING:
+                        return
+                    st = p.print_rows(rows, darkness=darkness)
+                    n += 1
+            log(f"job {job.id}: {n} label(s)" + (f", battery {st['battery']} %" if st else ""))
+
+    def attributes(self, base_uri):
+        media = [media_name(n) for n in LENGTHS]
+        return [
+            (CHARSET, "charset-configured", ["utf-8"]),
+            (CHARSET, "charset-supported", ["utf-8"]),
+            (KEYWORD, "compression-supported", ["none"]),
+            (INTEGER, "copies-default", [1]),
+            (RANGE, "copies-supported", [(1, 99)]),
+            (MIME, "document-format-default", ["image/pwg-raster"]),
+            (MIME, "document-format-supported", ["image/pwg-raster", "application/octet-stream"]),
+            (LANG, "generated-natural-language-supported", ["en"]),
+            (KEYWORD, "identify-actions-default", ["display"]),
+            (KEYWORD, "identify-actions-supported", ["display"]),
+            (KEYWORD, "ipp-features-supported", ["ipp-everywhere"]),
+            (KEYWORD, "ipp-versions-supported", ["1.1", "2.0"]),
+            (KEYWORD, "job-creation-attributes-supported",
+             ["copies", "media", "media-col", "print-quality", "print-color-mode", "sides"]),
+            (KEYWORD, "media-col-supported", ["media-size", "media-bottom-margin", "media-left-margin",
+                                              "media-right-margin", "media-top-margin", "media-source", "media-type"]),
+            (BEGCOL, "media-col-database", [media_col(n * 100) for n in LENGTHS]
+             + [media_col((MIN_LEN * 100, MAX_LEN * 100))]),
+            (BEGCOL, "media-col-default", [media_col(4000)]),
+            (BEGCOL, "media-col-ready", [media_col(4000)]),
+            (KEYWORD, "media-default", [media_name(40)]),
+            (KEYWORD, "media-ready", [media_name(40)]),
+            (KEYWORD, "media-supported", media + [f"custom_min_{MIN_LEN}x16mm", f"custom_max_{MAX_LEN}x16mm"]),
+            (BEGCOL, "media-size-supported",
+             [[(INTEGER, "x-dimension", [n * 100]), (INTEGER, "y-dimension", [1600])] for n in LENGTHS]
+             + [[(RANGE, "x-dimension", [(MIN_LEN * 100, MAX_LEN * 100)]), (INTEGER, "y-dimension", [1600])]]),
+            *[(INTEGER, f"media-{s}-margin-supported", [0]) for s in ("bottom", "left", "right", "top")],
+            (KEYWORD, "media-source-supported", ["main"]),
+            (KEYWORD, "media-type-supported", ["labels-continuous"]),
+            (KEYWORD, "multiple-document-handling-supported", ["separate-documents-uncollated-copies"]),
+            (LANG, "natural-language-configured", ["en"]),
+            (ENUM, "operations-supported", OPERATIONS),
+            (ENUM, "orientation-requested-default", [3]),
+            (ENUM, "orientation-requested-supported", [3]),
+            (KEYWORD, "output-bin-default", ["face-up"]),
+            (KEYWORD, "output-bin-supported", ["face-up"]),
+            (KEYWORD, "pdl-override-supported", ["attempted"]),
+            (KEYWORD, "print-color-mode-default", ["monochrome"]),
+            (KEYWORD, "print-color-mode-supported", ["monochrome"]),
+            (ENUM, "print-quality-default", [4]),
+            (ENUM, "print-quality-supported", [3, 4, 5]),
+            (KEYWORD, "print-scaling-default", ["none"]),
+            (KEYWORD, "print-scaling-supported", ["none", "fit", "fill", "auto"]),
+            (TEXT, "printer-device-id", ["MFG:MakeID;MDL:L1-C;CMD:PWGRaster;CLS:PRINTER;"]),
+            (TEXT, "printer-info", ["MakeID L1-C label printer"]),
+            (BOOLEAN, "printer-is-accepting-jobs", [True]),
+            (KEYWORD, "printer-kind", ["labels"]),
+            (TEXT, "printer-location", ["Bluetooth LE " + (self.addr or "")]),
+            (TEXT, "printer-make-and-model", ["MakeID L1-C"]),
+            (URI, "printer-more-info", [base_uri.replace("ipp://", "http://", 1).removesuffix("/ipp/print") + "/"]),
+            (NAME, "printer-name", ["L1-C"]),
+            (RESOLUTION, "printer-resolution-default", [(203, 203, 3)]),
+            (RESOLUTION, "printer-resolution-supported", [(203, 203, 3)]),
+            (ENUM, "printer-state", [self.state]),
+            (TEXT, "printer-state-message", [self.message or ("printing" if self.state == BUSY else "idle")]),
+            (KEYWORD, "printer-state-reasons", [self.reasons]),
+            (INTEGER, "printer-up-time", [self.uptime()]),
+            (URI, "printer-uri-supported", [base_uri]),
+            (URI, "printer-uuid", [self.uuid]),
+            (INTEGER, "queued-job-count", [sum(j.state in (PENDING, PROCESSING) for j in self.jobs.values())]),
+            (RESOLUTION, "pwg-raster-document-resolution-supported", [(203, 203, 3)]),
+            (KEYWORD, "pwg-raster-document-sheet-back", ["normal"]),
+            (KEYWORD, "pwg-raster-document-type-supported", ["black_1", "sgray_8"]),
+            (KEYWORD, "sides-default", ["one-sided"]),
+            (KEYWORD, "sides-supported", ["one-sided"]),
+            (KEYWORD, "uri-authentication-supported", ["none"]),
+            (KEYWORD, "uri-security-supported", ["none"]),
+            (KEYWORD, "which-jobs-supported", ["completed", "not-completed", "all"]),
+        ]
+
+    def job_attributes(self, job, base_uri):
+        return [
+            (INTEGER, "job-id", [job.id]),
+            (URI, "job-uri", [f"{base_uri}/{job.id}"]),
+            (URI, "job-printer-uri", [base_uri]),
+            (NAME, "job-name", [job.name]),
+            (NAME, "job-originating-user-name", [job.user]),
+            (ENUM, "job-state", [job.state]),
+            (KEYWORD, "job-state-reasons", [job.reasons]),
+            (TEXT, "job-state-message", [job.message or ""]),
+            (INTEGER, "job-printer-up-time", [self.uptime()]),
+            (INTEGER, "time-at-creation", [job.created - int(self.started)]),
+            (INTEGER, "time-at-processing", [max(0, job.processing - int(self.started))]),
+            (INTEGER, "time-at-completed", [max(0, job.completed - int(self.started))]),
+        ]
+
+
+# --- HTTP / IPP server -------------------------------------------------------
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    printer: Printer = None
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def body(self):
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            data = bytearray()
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline().strip():
+                        pass
+                    return bytes(data)
+                data += self.rfile.read(size)
+                self.rfile.readline()
+        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+    def reply(self, code, ctype, data):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        p = self.printer
+        st = {IDLE: "idle", BUSY: "printing", STOPPED: "stopped"}[p.state]
+        html = (f"<!doctype html><title>MakeID L1-C</title><h1>MakeID L1-C</h1>"
+                f"<p>ipp://{self.headers.get('Host', 'localhost')}/ipp/print</p><p>{st} {p.message}</p>")
+        self.reply(200, "text/html; charset=utf-8", html.encode())
+
+    def do_POST(self):
+        data = self.body()
+        if self.headers.get("Content-Type", "").split(";")[0] != "application/ipp":
+            return self.reply(400, "text/plain", b"expected application/ipp")
+        try:
+            out = self.ipp(data)
+        except Exception as e:  # noqa: BLE001
+            log(f"bad request: {e!r}")
+            out = response(BAD_REQUEST, 0, [(T_OP, self.op_attrs())])
+        self.reply(200, "application/ipp", out)
+
+    def op_attrs(self, msg=None):
+        a = [(CHARSET, "attributes-charset", ["utf-8"]), (LANG, "attributes-natural-language", ["en"])]
+        if msg:
+            a.append((TEXT, "status-message", [msg]))
+        return a
+
+    def ipp(self, data):
+        _, op, rid, groups, doc = parse_request(data)
+        p = self.printer
+        base = f"ipp://{self.headers.get('Host', 'localhost:8631')}/ipp/print"
+        opa = groups.get(T_OP, {})
+        joba = groups.get(T_JOB, {})
+
+        def err(status, msg):
+            return response(status, rid, [(T_OP, self.op_attrs(msg))])
+
+        def job_ref():
+            if "job-id" in opa:
+                return p.jobs.get(opa["job-id"][0])
+            if "job-uri" in opa:
+                tail = opa["job-uri"][0].rsplit("/", 1)[-1]
+                return p.jobs.get(int(tail)) if tail.isdigit() else None
+            return None
+
+        def check_format():
+            fmt = opa.get("document-format", ["image/pwg-raster"])[0]
+            if fmt not in ("image/pwg-raster", "application/octet-stream"):
+                return err(FORMAT_UNSUPPORTED, f"unsupported document format {fmt}")
+            return None
+
+        if op == GET_PRINTER_ATTRIBUTES:
+            return response(OK, rid, [(T_OP, self.op_attrs()), (T_PRINTER, p.attributes(base))])
+
+        if op in (VALIDATE_JOB, PRINT_JOB, CREATE_JOB):
+            if (e := check_format()):
+                return e
+            if op == VALIDATE_JOB:
+                return response(OK, rid, [(T_OP, self.op_attrs())])
+            job = p.new_job(opa.get("job-name", ["untitled"])[0],
+                            opa.get("requesting-user-name", ["anonymous"])[0], joba)
+            if op == PRINT_JOB:
+                job.document = doc
+                p.queue.put(job)
+            log(f"job {job.id}: {job.name} from {job.user}")
+            return response(OK, rid, [(T_OP, self.op_attrs()), (T_JOB, p.job_attributes(job, base))])
+
+        if op == SEND_DOCUMENT:
+            job = job_ref()
+            if not job:
+                return err(NOT_FOUND, "no such job")
+            if (e := check_format()):
+                return e
+            if job.state != PENDING or job.document is not None:
+                return err(NOT_POSSIBLE, "job already has a document")
+            job.document = doc
+            p.queue.put(job)
+            return response(OK, rid, [(T_OP, self.op_attrs()), (T_JOB, p.job_attributes(job, base))])
+
+        if op == CLOSE_JOB:
+            job = job_ref()
+            if not job:
+                return err(NOT_FOUND, "no such job")
+            if job.document is None and job.state == PENDING:
+                job.state, job.reasons, job.completed = ABORTED, "aborted-by-system", int(time.time())
+            return response(OK, rid, [(T_OP, self.op_attrs()), (T_JOB, p.job_attributes(job, base))])
+
+        if op == CANCEL_JOB:
+            job = job_ref()
+            if not job:
+                return err(NOT_FOUND, "no such job")
+            if job.state >= CANCELED:
+                return err(NOT_POSSIBLE, "job already finished")
+            job.state, job.reasons, job.completed = CANCELED, "job-canceled-by-user", int(time.time())
+            return response(OK, rid, [(T_OP, self.op_attrs())])
+
+        if op == GET_JOB_ATTRIBUTES:
+            job = job_ref()
+            if not job:
+                return err(NOT_FOUND, "no such job")
+            return response(OK, rid, [(T_OP, self.op_attrs()), (T_JOB, p.job_attributes(job, base))])
+
+        if op == GET_JOBS:
+            which = opa.get("which-jobs", ["not-completed"])[0]
+            jobs = [j for j in p.jobs.values()
+                    if which == "all" or (which == "completed") == (j.state >= CANCELED)]
+            return response(OK, rid, [(T_OP, self.op_attrs())] + [(T_JOB, p.job_attributes(j, base)) for j in jobs])
+
+        if op == IDENTIFY_PRINTER:
+            return response(OK, rid, [(T_OP, self.op_attrs())])
+
+        return err(OP_UNSUPPORTED, f"operation 0x{op:04x} not supported")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-a", "--addr", help="printer address (default: $L1C_ADDR or search per job)")
+    ap.add_argument("-l", "--listen", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    ap.add_argument("-p", "--port", type=int, default=8631)
+    a = ap.parse_args()
+    Handler.printer = Printer(a.addr)
+    srv = ThreadingHTTPServer((a.listen, a.port), Handler)
+    log(f"l1c-ippd: ipp://{a.listen}:{a.port}/ipp/print")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

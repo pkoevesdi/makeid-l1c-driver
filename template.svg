@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+     xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+     width="40mm" height="16mm" viewBox="0 0 40 16">
+  <sodipodi:namedview inkscape:document-units="mm" showguides="true">
+    <sodipodi:guide position="0,2" orientation="0,1" inkscape:label="printable band bottom" inkscape:locked="true"/>
+    <sodipodi:guide position="0,14" orientation="0,1" inkscape:label="printable band top" inkscape:locked="true"/>
+    <sodipodi:guide position="4,0" orientation="1,0" inkscape:label="lead-in (cut off)" inkscape:locked="true"/>
+    <sodipodi:guide position="36,0" orientation="1,0" inkscape:label="lead-out (cut off, move with page length)" inkscape:locked="true"/>
+  </sodipodi:namedview>
+  <g inkscape:groupmode="layer" inkscape:label="Label" id="label"/>
+</svg>

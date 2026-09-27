@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="40mm" height="16mm" viewBox="0 0 40 16">
+  <rect x="0.5" y="2.5" width="39" height="11" fill="none" stroke="#000" stroke-width="0.4"/>
+  <text x="20" y="10.5" font-family="DejaVu Sans" font-weight="bold" font-size="6" text-anchor="middle">L1-C</text>
+</svg>
