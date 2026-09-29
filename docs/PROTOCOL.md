@@ -48,8 +48,8 @@ L1-C firmware `V1.0_250317.2` answers with 37 bytes.
 | 6 | bits 0–2 head DPI (0 = 203) |
 | 8–9 | last label length in dots, LE |
 | 10–14 | printer type, ASCII (`L1C`) |
-| 16–17 | tape remaining, LE (unit unknown) |
-| 18–19 | tape total, LE (4000 for `LC-16W`) |
+| 16–17 | tape remaining, LE, in mm (a 100 mm blank label, 108 mm with lead-in and lead-out, lowered it by 106) |
+| 18–19 | tape total, LE, in mm (4000 for `LC-16W`, a 4 m roll). Both values come from the tape cassette: with the cassette not seated they read 0 and the tape type is empty |
 | 20–33 | tape type, ASCII (`LC-16W`) |
 | 35 | bits 5–6: printer-side request, 1 = pause, 3 = cancel |
 | 36–37 | protocol version major/minor, **absent on this firmware** |
@@ -93,3 +93,9 @@ Busy bit set: poll status until clear, then send the next block.
 1. `66 06 00 10 02 82`
 2. For each label, all its `0x1B` blocks as above.
 3. Poll status until not busy.
+
+The printer feeds the 4 mm lead-out of a label only after a pause of a few seconds (10 s is
+enough, 1–3 s is not). Labels sent before that, in one job or in separate ones, follow each
+other on the tape without a gap, whatever "labels in job" and "current label" say.
+`l1c-ippd` therefore puts 8 mm of blank lines with a cut line between the labels of one job and
+waits 10 s before the next job.

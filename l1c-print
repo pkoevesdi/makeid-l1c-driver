@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Print a label on the MakeID L1-C directly, without CUPS: SVG, PNG or text."""
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -9,12 +10,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import l1c  # noqa: E402
-from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+from PIL import Image, ImageDraw, ImageFont, ImageOps  # noqa: E402
 
 
 def inkscape_cmd():
     if shutil.which("inkscape"):
         return ["inkscape"]
+    if sys.platform == "win32":
+        exe = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Inkscape" / "bin" / "inkscape.exe"
+        if exe.exists():
+            return [str(exe)]
     return ["flatpak", "run", "--command=inkscape", "org.inkscape.Inkscape"]
 
 
@@ -30,15 +35,22 @@ def load_svg(svg):
         return Image.open(png).copy()
 
 
-def render_text(text, font="DejaVuSans-Bold.ttf", size=64):
-    f = ImageFont.truetype(font, size)
+def render_text(text, fonts=("DejaVuSans-Bold.ttf", "arialbd.ttf"), size=64):
+    for font in fonts:
+        try:
+            f = ImageFont.truetype(font, size)
+            break
+        except OSError:
+            continue
+    else:
+        raise l1c.PrinterError("no font found: " + ", ".join(fonts))
     x0, y0, x1, y1 = f.getbbox(text)
     img = Image.new("L", (x1 - x0 + 2 * l1c.FEED, l1c.HEAD), 255)
     ImageDraw.Draw(img).text((l1c.FEED - x0, (l1c.HEAD - (y1 - y0)) // 2 - y0), text, font=f, fill=0)
     return img
 
 
-def to_bitmap(img, threshold=128):
+def to_bitmap(img, threshold=l1c.THRESHOLD):
     """Whole label (height 128 = 16 mm or 96 = 12 mm) → 1-bit image of what the head prints."""
     if img.mode in ("RGBA", "LA", "P"):
         img = Image.alpha_composite(Image.new("RGBA", img.size, "white"), img.convert("RGBA"))
@@ -47,10 +59,13 @@ def to_bitmap(img, threshold=128):
         g = g.crop((0, l1c.MARGIN, g.width, l1c.MARGIN + l1c.HEAD))
     elif g.height != l1c.HEAD:
         raise l1c.PrinterError(f"image is {g.height} px high, expected {l1c.TAPE} (16 mm) or {l1c.HEAD} (12 mm)")
-    if g.width <= 2 * l1c.FEED:
-        raise l1c.PrinterError("label shorter than the 8 mm the printer feeds anyway")
-    g = g.crop((l1c.FEED, 0, g.width - l1c.FEED, g.height))    # the printer adds these 4 mm itself
-    return g.point(lambda v: 255 if v >= threshold else 0, "1")
+    bm = g.point(lambda v: 255 if v >= threshold else 0, "1")
+    box = ImageOps.invert(bm.convert("L")).getbbox()
+    if not box:
+        raise l1c.PrinterError("image is empty")
+    # As l1c.raster_label(): the printer feeds 4 mm before and after, so up to 4 mm of blank
+    # at the start and all blank at the end are left out; nothing drawn is cut off.
+    return bm.crop((min(l1c.FEED, box[0]), 0, box[2], bm.height))
 
 
 def main():

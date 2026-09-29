@@ -151,8 +151,10 @@ def response(status, rid, groups):
 
 # --- Printer model -----------------------------------------------------------
 
-LENGTHS = [20, 25, 30, 40, 50, 60, 80, 100, 150, 200]      # mm
-MIN_LEN, MAX_LEN = 10, 1000
+MIN_LEN, MAX_LEN = 10, 1000   # mm
+# The label ends 4 mm after its last dot, whatever the page length. So there is one paper size,
+# the longest, and nothing to choose; CUPS may also send a custom page within the range.
+LABEL_PAUSE = 10       # s; after this pause the printer has fed the lead-out of the last label
 
 
 def media_name(mm):
@@ -187,6 +189,7 @@ class Printer:
         self.lock = threading.Lock()
         self.queue = queue.Queue()
         self.state, self.reasons, self.message = IDLE, "none", ""
+        self.last_label = -LABEL_PAUSE
         threading.Thread(target=self.worker, daemon=True).start()
 
     def uptime(self):
@@ -233,22 +236,28 @@ class Printer:
         copies = job.attrs.get("copies", [1])[0]
         quality = job.attrs.get("print-quality", [4])[0]
         darkness = {3: 10, 4: 15, 5: 20}.get(quality, 15)
-        with l1c.L1C(self.addr) as p:
-            p.check_ready()
-            n = 0
-            for _ in range(max(1, copies)):
-                for rows in labels:
-                    if job.state != PROCESSING:
-                        return
-                    st = p.print_rows(rows, darkness=darkness)
-                    n += 1
-            log(f"job {job.id}: {n} label(s)" + (f", battery {st['battery']} %" if st else ""))
+        # A job right after the previous one would follow it on the tape without a gap.
+        time.sleep(max(0, self.last_label + LABEL_PAUSE - time.monotonic()))
+        try:
+            with l1c.L1C(self.addr) as p:
+                p.check_ready()
+                n = 0
+                for _ in range(max(1, copies)):
+                    for rows in labels:
+                        if job.state != PROCESSING:
+                            return
+                        st = p.print_rows((l1c.cut_gap() if n else []) + rows, darkness=darkness)
+                        n += 1
+                log(f"job {job.id}: {n} label(s)" + (f", battery {st['battery']} %" if st else ""))
+        finally:
+            self.last_label = time.monotonic()
 
     def attributes(self, base_uri):
-        media = [media_name(n) for n in LENGTHS]
+        media = [media_name(MAX_LEN)]
         return [
             (CHARSET, "charset-configured", ["utf-8"]),
             (CHARSET, "charset-supported", ["utf-8"]),
+            (BOOLEAN, "color-supported", [False]),
             (KEYWORD, "compression-supported", ["none"]),
             (INTEGER, "copies-default", [1]),
             (RANGE, "copies-supported", [(1, 99)]),
@@ -263,15 +272,17 @@ class Printer:
              ["copies", "media", "media-col", "print-quality", "print-color-mode", "sides"]),
             (KEYWORD, "media-col-supported", ["media-size", "media-bottom-margin", "media-left-margin",
                                               "media-right-margin", "media-top-margin", "media-source", "media-type"]),
-            (BEGCOL, "media-col-database", [media_col(n * 100) for n in LENGTHS]
-             + [media_col((MIN_LEN * 100, MAX_LEN * 100))]),
-            (BEGCOL, "media-col-default", [media_col(4000)]),
-            (BEGCOL, "media-col-ready", [media_col(4000)]),
-            (KEYWORD, "media-default", [media_name(40)]),
-            (KEYWORD, "media-ready", [media_name(40)]),
+            # No range here: Windows' IPP class driver rejects the whole printer when an
+            # x-dimension in media-col-database is not an integer. The custom range is in
+            # media-size-supported and media-supported.
+            (BEGCOL, "media-col-database", [media_col(MAX_LEN * 100)]),
+            (BEGCOL, "media-col-default", [media_col(MAX_LEN * 100)]),
+            (BEGCOL, "media-col-ready", [media_col(MAX_LEN * 100)]),
+            (KEYWORD, "media-default", [media_name(MAX_LEN)]),
+            (KEYWORD, "media-ready", [media_name(MAX_LEN)]),
             (KEYWORD, "media-supported", media + [f"custom_min_{MIN_LEN}x16mm", f"custom_max_{MAX_LEN}x16mm"]),
             (BEGCOL, "media-size-supported",
-             [[(INTEGER, "x-dimension", [n * 100]), (INTEGER, "y-dimension", [1600])] for n in LENGTHS]
+             [[(INTEGER, "x-dimension", [MAX_LEN * 100]), (INTEGER, "y-dimension", [1600])]]
              + [[(RANGE, "x-dimension", [(MIN_LEN * 100, MAX_LEN * 100)]), (INTEGER, "y-dimension", [1600])]]),
             *[(INTEGER, f"media-{s}-margin-supported", [0]) for s in ("bottom", "left", "right", "top")],
             (KEYWORD, "media-source-supported", ["main"]),
@@ -289,7 +300,7 @@ class Printer:
             (ENUM, "print-quality-default", [4]),
             (ENUM, "print-quality-supported", [3, 4, 5]),
             (KEYWORD, "print-scaling-default", ["none"]),
-            (KEYWORD, "print-scaling-supported", ["none", "fit", "fill", "auto"]),
+            (KEYWORD, "print-scaling-supported", ["none"]),   # 1:1, so the label is as long as the design
             (TEXT, "printer-device-id", ["MFG:MakeID;MDL:L1-C;CMD:PWGRaster;CLS:PRINTER;"]),
             (TEXT, "printer-info", ["MakeID L1-C label printer"]),
             (BOOLEAN, "printer-is-accepting-jobs", [True]),
@@ -309,7 +320,7 @@ class Printer:
             (INTEGER, "queued-job-count", [sum(j.state in (PENDING, PROCESSING) for j in self.jobs.values())]),
             (RESOLUTION, "pwg-raster-document-resolution-supported", [(203, 203, 3)]),
             (KEYWORD, "pwg-raster-document-sheet-back", ["normal"]),
-            (KEYWORD, "pwg-raster-document-type-supported", ["black_1", "sgray_8"]),
+            (KEYWORD, "pwg-raster-document-type-supported", ["sgray_8"]),   # black_1 is read too
             (KEYWORD, "sides-default", ["one-sided"]),
             (KEYWORD, "sides-supported", ["one-sided"]),
             (KEYWORD, "uri-authentication-supported", ["none"]),
