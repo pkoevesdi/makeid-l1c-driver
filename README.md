@@ -80,19 +80,18 @@ To remove it, run `windows\uninstall.ps1`.
 ## Design and print
 
 1. Open `template.svg` in Inkscape.
-2. Design the label in mm. The page is the whole label: 16 mm high, as long as you like
-   (Document Properties).
+2. Design the label in mm, starting at the left edge of the page. The page is 16 mm high and
+   1000 mm long, the longest label; there is no need to resize it.
 3. Print with File â†’ Print â†’ **L1-C**.
 
 The guides in the template show:
 
 - the printable band from 2 to 14 mm (the head is 12 mm wide)
-- 4 mm at each end, which the printer feeds blank itself. If you change the page length,
-  move the right-hand guide with it.
+- the 4 mm at the start, which the printer feeds blank itself. Drawn left of this guide, the
+  label gets longer at that end.
 
-Drawn within the guides, the label is exactly the page. Nothing is ever cut off: drawn beyond
-a guide, the label gets longer at that end. Blank tape after the last dot is not printed (on
-Windows the page length does not reach the printer), so the label always ends 4 mm after it.
+Blank tape after the last dot is not printed, so the label always ends 4 mm after it. Inkscape
+cuts off whatever lies outside the page.
 
 With the LED side towards you, the tape comes out to the left and reads normally.
 
